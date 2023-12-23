@@ -113,15 +113,10 @@ typedef struct json_string {
     size_t length;
 } JSON_String;
 
-typedef struct json_number {
-    double      number;
-    JSON_String number_as_string;
-} JSON_Number;
-
 /* Type definitions */
 typedef union json_value_value {
     JSON_String  string;
-    JSON_Number  number;
+    double       number;
     JSON_Object *object;
     JSON_Array  *array;
     int          boolean;
@@ -187,8 +182,7 @@ static JSON_Status  json_array_resize(JSON_Array *array, size_t new_capacity);
 static void         json_array_free(JSON_Array *array);
 
 /* JSON Value */
-static JSON_Value        * json_value_init_string_no_copy(char *string, size_t length);
-static JSON_Value        * json_value_init_number_as_string_no_copy(double number, char *number_as_string, size_t number_as_string_length);
+static JSON_Value * json_value_init_string_no_copy(char *string, size_t length);
 static const JSON_String * json_value_get_string_desc(const JSON_Value *value);
 
 /* Parser */
@@ -206,7 +200,7 @@ static JSON_Value *  parse_value(const char **string, size_t nesting);
 
 /* Serialization */
 static int json_serialize_to_buffer_r(const JSON_Value *value, char *buf, int level, parson_bool_t is_pretty, char *num_buf);
-static int json_serialize_string(const char *string, size_t len, int quotes, char *buf);
+static int json_serialize_string(const char *string, size_t len, char *buf);
 
 /* Various */
 static char * read_file(const char * filename) {
@@ -789,19 +783,6 @@ static JSON_Value * json_value_init_string_no_copy(char *string, size_t length) 
     return new_value;
 }
 
-static JSON_Value * json_value_init_number_as_string_no_copy(double number, char *number_as_string, size_t number_as_string_length) {
-    JSON_Value * new_value = (JSON_Value*)parson_malloc(sizeof(JSON_Value));
-    if (!new_value) {
-        return NULL;
-    }
-    new_value->parent = NULL;
-    new_value->type = JSONNumber;
-    new_value->value.number.number = number;
-    new_value->value.number.number_as_string.chars = number_as_string;
-    new_value->value.number.number_as_string.length = number_as_string_length;
-    return new_value;
-}
-
 /* Parser */
 static JSON_Status skip_quotes(const char **string) {
     if (**string != '\"') {
@@ -1117,13 +1098,17 @@ static JSON_Value * parse_boolean_value(const char **string) {
 
 static JSON_Value * parse_number_value(const char **string) {
     char *end;
-    JSON_Value * value;
-    size_t length;
-    strtod(*string, &end);
-    length = end - *string;
-    value = json_value_init_number_as_string_with_len(*string, length);
+    double number = 0;
+    errno = 0;
+    number = strtod(*string, &end);
+    if (errno == ERANGE && (number <= -HUGE_VAL || number >= HUGE_VAL)) {
+        return NULL;
+    }
+    if ((errno && errno != ERANGE) || !is_decimal(*string, end - *string)) {
+        return NULL;
+    }
     *string = end;
-    return value;
+    return json_value_init_number(number);
 }
 
 static JSON_Value * parse_null_value(const char **string) {
@@ -1218,7 +1203,7 @@ static int json_serialize_to_buffer_r(const JSON_Value *value, char *buf, int le
                     APPEND_INDENT(level+1);
                 }
                 /* We do not support key names with embedded \0 chars */
-                written = json_serialize_string(key, strlen(key), PARSON_TRUE, buf);
+                written = json_serialize_string(key, strlen(key), buf);
                 if (written < 0) {
                     return -1;
                 }
@@ -1257,7 +1242,7 @@ static int json_serialize_to_buffer_r(const JSON_Value *value, char *buf, int le
                 return -1;
             }
             len = json_value_get_string_len(value);
-            written = json_serialize_string(string, len, PARSON_TRUE, buf);
+            written = json_serialize_string(string, len, buf);
             if (written < 0) {
                 return -1;
             }
@@ -1274,22 +1259,15 @@ static int json_serialize_to_buffer_r(const JSON_Value *value, char *buf, int le
             }
             return written_total;
         case JSONNumber:
+            num = json_value_get_number(value);
             if (buf != NULL) {
                 num_buf = buf;
             }
             if (parson_number_serialization_function) {
-                num = json_value_get_number(value);
                 written = parson_number_serialization_function(num, num_buf);
-            } else if (parson_float_format) {
-                num = json_value_get_number(value);
-                written = sprintf(num_buf, parson_float_format, num);
             } else {
-                string = json_value_get_number_as_string(value);
-                if (string == NULL) {
-                    return -1;
-                }
-                len = json_value_get_number_as_string_len(value);
-                written = json_serialize_string(string, len, PARSON_FALSE, num_buf);
+                const char *float_format = parson_float_format ? parson_float_format : PARSON_DEFAULT_FLOAT_FORMAT;
+                written = parson_sprintf(num_buf, float_format, num);
             }
             if (written < 0) {
                 return -1;
@@ -1309,13 +1287,11 @@ static int json_serialize_to_buffer_r(const JSON_Value *value, char *buf, int le
     }
 }
 
-static int json_serialize_string(const char *string, size_t len, int quotes, char *buf) {
+static int json_serialize_string(const char *string, size_t len, char *buf) {
     size_t i = 0;
     char c = '\0';
     int written = -1, written_total = 0;
-    if (quotes) {
-        APPEND_STRING("\"");
-    }
+    APPEND_STRING("\"");
     for (i = 0; i < len; i++) {
         c = string[i];
         switch (c) {
@@ -1374,9 +1350,7 @@ static int json_serialize_string(const char *string, size_t len, int quotes, cha
                 break;
         }
     }
-    if (quotes) {
-        APPEND_STRING("\"");
-    }
+    APPEND_STRING("\"");
     return written_total;
 }
 
@@ -1611,21 +1585,7 @@ size_t json_value_get_string_len(const JSON_Value *value) {
 }
 
 double json_value_get_number(const JSON_Value *value) {
-    return json_value_get_type(value) == JSONNumber ? value->value.number.number : 0;
-}
-
-static const JSON_String * json_value_get_number_as_string_desc(const JSON_Value *value) {
-    return json_value_get_type(value) == JSONNumber ? &value->value.number.number_as_string : NULL;
-}
-
-const char * json_value_get_number_as_string(const JSON_Value *value) {
-    const JSON_String *str = json_value_get_number_as_string_desc(value);
-    return str ? str->chars : NULL;
-}
-
-size_t json_value_get_number_as_string_len(const JSON_Value *value) {
-    const JSON_String *str = json_value_get_number_as_string_desc(value);
-    return str ? str->length : 0;
+    return json_value_get_type(value) == JSONNumber ? value->value.number : 0;
 }
 
 int json_value_get_boolean(const JSON_Value *value) {
@@ -1640,9 +1600,6 @@ void json_value_free(JSON_Value *value) {
     switch (json_value_get_type(value)) {
         case JSONObject:
             json_object_free(value->value.object);
-            break;
-        case JSONNumber:
-            parson_free(value->value.number.number_as_string.chars);
             break;
         case JSONString:
             parson_free(value->value.string.chars);
@@ -1715,65 +1672,17 @@ JSON_Value * json_value_init_string_with_len(const char *string, size_t length) 
 
 JSON_Value * json_value_init_number(double number) {
     JSON_Value *new_value = NULL;
-    char number_as_string[PARSON_NUM_BUF_SIZE];
-    char *number_as_string_copy = NULL;
-    size_t number_as_string_length = -1;
     if (IS_NUMBER_INVALID(number)) {
         return NULL;
     }
-    if (parson_number_serialization_function) {
-        number_as_string_length = parson_number_serialization_function(number, number_as_string);
-    } else if (parson_float_format) {
-        number_as_string_length = sprintf(number_as_string, parson_float_format, number);
-    } else {
-        number_as_string_length = sprintf(number_as_string, PARSON_DEFAULT_FLOAT_FORMAT, number);
-    }
-    number_as_string_copy = parson_strndup(number_as_string, number_as_string_length);
-    if (!number_as_string_copy) {
+    new_value = (JSON_Value*)parson_malloc(sizeof(JSON_Value));
+    if (new_value == NULL) {
         return NULL;
     }
-    new_value = json_value_init_number_as_string_no_copy(number, number_as_string_copy, number_as_string_length);
-    if (!new_value) {
-        parson_free(number_as_string_copy);
-    }
+    new_value->parent = NULL;
+    new_value->type = JSONNumber;
+    new_value->value.number = number;
     return new_value;
-}
-
-JSON_Value * json_value_init_number_as_string(const char *number) {
-    if (number == NULL) {
-        return NULL;
-    }
-    return json_value_init_number_as_string_with_len(number, strlen(number));
-}
-
-JSON_Value * json_value_init_number_as_string_with_len(const char *number_as_string, size_t number_as_string_length) {
-    double number;
-    char *number_as_string_copy;
-    char *end = NULL;
-    JSON_Value *value = NULL;
-    errno = 0;
-    if (number_as_string == NULL) {
-        return NULL;
-    }
-    /* double representation */
-    number = strtod(number_as_string, &end);
-    if (errno == ERANGE && (number <= -HUGE_VAL || number >= HUGE_VAL)) {
-        return NULL;
-    }
-    if ((errno && errno != ERANGE) || !is_decimal(number_as_string, number_as_string_length)) {
-        return NULL;
-    }
-    /* string representation */
-    number_as_string_copy = parson_strndup(number_as_string, number_as_string_length);
-    if (number_as_string_copy == NULL) {
-        return NULL;
-    }
-    /* combined representations */
-    value = json_value_init_number_as_string_no_copy(number, number_as_string_copy, number_as_string_length);
-    if (!value) {
-        parson_free(number_as_string_copy);
-    }
-    return value;
 }
 
 JSON_Value * json_value_init_boolean(int boolean) {
@@ -1863,19 +1772,7 @@ JSON_Value * json_value_deep_copy(const JSON_Value *value) {
         case JSONBoolean:
             return json_value_init_boolean(json_value_get_boolean(value));
         case JSONNumber:
-            temp_string = json_value_get_number_as_string_desc(value);
-            if (temp_string == NULL) {
-                return NULL;
-            }
-            temp_string_copy = parson_strndup(temp_string->chars, temp_string->length);
-            if (temp_string_copy == NULL) {
-                return NULL;
-            }
-            return_value = json_value_init_number_as_string_no_copy(json_value_get_number(value), temp_string_copy, temp_string->length);
-            if (return_value == NULL) {
-                parson_free(temp_string_copy);
-            }
-            return return_value;
+            return json_value_init_number(json_value_get_number(value));
         case JSONString:
             temp_string = json_value_get_string_desc(value);
             if (temp_string == NULL) {
@@ -2586,4 +2483,234 @@ void json_set_float_serialization_format(const char *format) {
 
 void json_set_number_serialization_function(JSON_Number_Serialization_Function func) {
     parson_number_serialization_function = func;
+}
+
+bool is_json(JSON_Value *schema) {
+    return (schema == NULL || json_value_get_type(schema) == JSONError) ? false : true;
+}
+
+char *json_serialize(JSON_Value *value, bool is_pretty) {
+    char *json_string = NULL;
+    if (value != NULL) {
+        if (is_pretty)
+            json_string = json_serialize_to_string_pretty(value);
+        else
+            json_string = json_serialize_to_string(value);
+    }
+
+    return json_string;
+}
+
+JSON_Value *json_decode(const char *text, bool is_commented) {
+    if (is_commented)
+        return json_parse_string_with_comments(text);
+    else
+        return json_parse_string(text);
+}
+
+JSON_Value *json_encode(const char *desc, ...) {
+    int count = (int)strlen(desc);
+    JSON_Value *json_root = json_value_init_object();
+    JSON_Object *json_object = json_value_get_object(json_root);
+
+    va_list argp;
+    char *key, value_char;
+    int value_bool;
+    JSON_Status status = JSONSuccess;
+    void *value_any = NULL;
+    JSON_Array *value_array = NULL;
+    double value_float = 0;
+    long value_int = 0;
+    size_t value_max = 0;
+    bool is_dot = false, is_array = false, is_double = false, is_int = false, is_max = false;
+
+    va_start(argp, desc);
+    for (int i = 0; i < count; i++) {
+        if (status == JSONFailure)
+            return NULL;
+
+        switch (*desc++) {
+            case '.':
+                is_dot = true;
+                break;
+            case 'e':
+                if (is_array) {
+                    is_array = false;
+                    value_array = NULL;
+                    is_dot = false;
+                }
+                break;
+            case 'a':
+                if (!is_array) {
+                    key = va_arg(argp, char *);
+                    status = json_object_set_value(json_object, key, json_value_init_array());
+                    value_array = json_object_get_array(json_object, key);
+                    is_array = true;
+                    is_dot = false;
+                }
+                break;
+            case 'n':
+                if (!is_array)
+                    key = va_arg(argp, char *);
+
+                if (is_array)
+                    status = json_array_append_null(value_array);
+                else if (is_dot)
+                    status = json_object_dotset_null(json_object, key);
+                else
+                    status = json_object_set_null(json_object, key);
+                is_dot = false;
+                break;
+            case 'd':
+                is_int = true;
+            case 'f':
+                if (!is_int)
+                    is_double = true;
+            case 'i':
+                if (!is_double && !is_int)
+                    is_max = true;
+
+                if (!is_array)
+                    key = va_arg(argp, char *);
+
+                if (is_double)
+                    value_float = va_arg(argp, double);
+                else if (is_int)
+                    value_int = va_arg(argp, long);
+                else
+                    value_max = va_arg(argp, size_t);
+
+                if (is_array)
+                    status = json_array_append_number(value_array, (is_double ? value_float
+                                                                    : is_int ? (int)value_int
+                                                                    : (unsigned long)value_max));
+                else if (is_dot)
+                    status = json_object_dotset_number(json_object, key, (is_double ? value_float
+                                                                          : is_int ? (int)value_int
+                                                                          : (unsigned long)value_max));
+                else
+                    status = json_object_set_number(json_object, key, (is_double ? value_float
+                                                                       : is_int ? (int)value_int
+                                                                       : (unsigned long)value_max));
+
+                is_dot = false;
+                is_double = false;
+                is_int = false;
+                is_max = false;
+                break;
+            case 'b':
+                if (!is_array)
+                    key = va_arg(argp, char *);
+
+                value_bool = va_arg(argp, int);
+                if (is_array)
+                    status = json_array_append_boolean(value_array, value_bool);
+                else if (is_dot)
+                    status = json_object_dotset_boolean(json_object, key, value_bool);
+                else
+                    status = json_object_set_boolean(json_object, key, value_bool);
+                is_dot = false;
+                break;
+            case 's':
+                if (!is_array)
+                    key = va_arg(argp, char *);
+
+                value_char = va_arg(argp, char *);
+                if (is_array)
+                    status = json_array_append_string(value_array, value_char);
+                else if (is_dot)
+                    status = json_object_dotset_string(json_object, key, value_char);
+                else
+                    status = json_object_set_string(json_object, key, value_char);
+                is_dot = false;
+                break;
+            case 'v':
+                if (!is_array)
+                    key = va_arg(argp, char *);
+
+                value_any = va_arg(argp, void *);
+                if (is_array)
+                    status = json_array_append_value(value_array, value_any);
+                else if (is_dot)
+                    status = json_object_dotset_value(json_object, key, value_any);
+                else
+                    status = json_object_set_value(json_object, key, value_any);
+                is_dot = false;
+                break;
+            default:
+                break;
+        }
+    }
+    va_end(argp);
+
+    return json_root;
+}
+
+JSON_Value *json_for(const char *desc, ...) {
+    int count = (int)strlen(desc);
+    JSON_Value *json_root = json_value_init_object();
+    JSON_Object *json_object = json_value_get_object(json_root);
+    JSON_Status status = json_object_set_value(json_object, "array", json_value_init_array());
+    JSON_Array *value_array = json_object_get_array(json_object, "array");
+
+    va_list argp;
+    char *value_char;
+    int value_bool;
+    void *value_any = NULL;
+    double value_float = 0;
+    long  value_int = 0;
+    size_t value_max = 0;
+    bool is_double = false, is_int = false, is_max = false;
+
+    va_start(argp, desc);
+    for (int i = 0; i < count; i++) {
+        if (status == JSONFailure)
+            return NULL;
+
+        switch (*desc++) {
+            case 'n':
+                status = json_array_append_null(value_array);
+                break;
+            case 'd':
+                is_int = true;
+            case 'f':
+                if (!is_int)
+                    is_double = true;
+            case 'i':
+                if (!is_double && !is_int)
+                    is_max = true;
+
+                if (is_double)
+                    value_float = va_arg(argp, double);
+                else if (is_int)
+                    value_int = va_arg(argp, long);
+                else
+                    value_max = va_arg(argp, size_t);
+
+                status = json_array_append_number(value_array, (is_double ? value_float
+                                                                : is_int ? (int)value_int
+                                                                : (unsigned long)value_max));
+                is_double = false;
+                is_int = false;
+                is_max = false;
+                break;
+            case 'b':
+                value_bool = va_arg(argp, int);
+                status = json_array_append_boolean(value_array, value_bool);
+                break;
+            case 's':
+                value_char = va_arg(argp, char *);
+                status = json_array_append_string(value_array, value_char);
+                break;
+            case 'v':
+                value_any = va_arg(argp, void *);
+                status = json_array_append_value(value_array, value_any);
+                break;
+            default:
+                break;
+        }
+    }
+    va_end(argp);
+
+    return json_array_get_wrapping_value(value_array);
 }

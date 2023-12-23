@@ -830,6 +830,27 @@ void serialization_example(void) {
     json_value_free(root_value);
 }
 
+void encode_decode_example(void) {
+    JSON_Value *value = json_for("ss", "email@example.com", "email2@example.com");
+    char *serialized_for = json_serialize(value, false);
+    char *serialized_string = NULL;
+    JSON_Value *encoded = json_encode("si.s.v",
+                                      kv("name", "John Smith"),
+                                      kv("age", 25),
+                                      kv("address.city", "Cupertino"),
+                                      kv("contact.emails", json_decode(serialized_for, false)));
+
+    if (is_json(encoded)) {
+        serialized_string = json_serialize(encoded, true);
+        puts(serialized_string);
+    }
+
+    json_free_serialized_string(serialized_for);
+    json_free_serialized_string(serialized_string);
+    json_value_free(encoded);
+    json_value_free(value);
+}
+
 static char * read_file(const char * file_path) {
     FILE *fp = NULL;
     size_t size_to_read = 0;
