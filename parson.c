@@ -2514,7 +2514,7 @@ JSON_Value *json_encode(const char *desc, ...) {
     JSON_Object *json_object = json_value_get_object(json_root);
 
     va_list argp;
-    char *key, value_char;
+    char *key, *value_char;
     int value_bool;
     JSON_Status status = JSONSuccess;
     void *value_any = NULL;

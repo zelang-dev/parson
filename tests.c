@@ -73,6 +73,7 @@ void test_object_clear(void);
 void print_commits_info(const char *username, const char *repo);
 void persistence_example(void);
 void serialization_example(void);
+void encode_decode_example(void);
 
 static const char *g_tests_path = "tests";
 
@@ -112,6 +113,8 @@ int tests_main(int argc, char *argv[]) {
     /* print_commits_info("torvalds", "linux"); */
     /* serialization_example(); */
     /* persistence_example(); */
+
+    encode_decode_example();
 
     puts("################################################################################");
     puts("Running parson tests");
